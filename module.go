@@ -1,77 +1,80 @@
 package volume
 
 import (
-  "fmt"
-  "io/ioutil"
-  "math"
-  "strconv"
-  "strings"
-  "time"
+	"time"
 
-  "barista.run/bar"
-  "barista.run/base/value"
-  "barista.run/outputs"
-  "barista.run/timing"
+	"github.com/barista-run/barista/bar"
+	"github.com/barista-run/barista/base/value"
+	"github.com/barista-run/barista/outputs"
+	"github.com/barista-run/barista/timing"
 )
 
-SINK_NAME="@DEFAULT_AUDIO_SINK@"
-SOURCE_NAME="@DEFAULT_AUDIO_SOURCE@"
-
+// Module represents a volume bar module
 type Module struct {
-  outputFunc value.Value // of func(Volume) bar.Output
-  provider   Provider
+	outputFunc value.Value // of func(int, bool, bool) bar.Output
+	scheduler  *timing.Scheduler
+	device     string // The device to monitor (e.g., @DEFAULT_AUDIO_SINK@ or specific device ID)
+	isMic      bool   // True for microphone, false for speaker/headphones
 }
 
-// Output configures a module to display the output of a user-defined
-// function.
-func (m *Module) Output(outputFunc func(Volume) bar.Output) *Module {
-  m.outputFunc.Set(outputFunc)
-  return m
+// Initializes a new volume module for a specific device
+func New(device string, isMic bool) *Module {
+	m := &Module{
+		scheduler: timing.NewScheduler(),
+		device:    device,
+		isMic:     isMic,
+	}
+
+	m.RefreshInterval(5 * time.Second)
+
+	m.outputFunc.Set(func(vol int, muted bool, isMic bool) bar.Output {
+		return outputs.Textf("%d%%", vol)
+	})
+
+	return m
 }
 
-// RateLimiter throttles volume updates to once every ~20ms to avoid unexpected behaviour.
-var RateLimiter = rate.NewLimiter(rate.Every(20*time.Millisecond), 1)
+func (m *Module) RefreshInterval(interval time.Duration) *Module {
+	m.scheduler.Every(interval)
+	return m
+}
 
+// Allows custom output formatting
+func (m *Module) Output(outputFunc func(int, bool, bool) bar.Output) *Module {
+	m.outputFunc.Set(outputFunc)
+	return m
+}
+
+// Streams real-time volume updates
 func (m *Module) Stream(s bar.Sink) {
-  var vol value.ErrorValue
+	outputFunc := m.outputFunc.Get().(func(int, bool, bool) bar.Output)
 
-  v, err := vol.Get()
-  nextV, done := vol.Subscribe()
-  defer done()
-  go m.provider.Worker(&vol)
+	// Detect the active audio device if using default playback
+	if !m.isMic {
+		activeDevice, err := getActiveAudioSink()
+		if err != nil {
+			s.Error(err)
+			return
+		}
+		m.device = activeDevice
+	}
 
-  outputFunc := m.outputFunc.Get().(func(Volume) bar.Output)
-  nextOutputFunc, done := m.outputFunc.Subscribe()
-  defer done()
+	// Initial volume fetch
+	volume, muted, err := getVolume(m.device)
+	if err != nil {
+		s.Error(err)
+		return
+	}
+	s.Output(outputFunc(volume, muted, m.isMic))
 
-  for {
-    if s.Error(err) {
-      return
-    }
-    if volume, ok := v.(Volume); ok {
-      volume.update = func(v Volume) { vol.Set(v) }
-      s.Output(outputs.Group(outputFunc(volume)).
-        OnClick(defaultClickHandler(volume)))
-    }
-    select {
-    case <-nextV:
-      v, err = vol.Get()
-    case <-nextOutputFunc:
-      outputFunc = m.outputFunc.Get().(func(Volume) bar.Output)
-    }
-  }
-}
+	for {
+		volume, muted, err = getVolume(m.device)
+		if err != nil {
+			s.Error(err)
+			return
+		}
+		s.Output(outputFunc(volume, muted, m.isMic))
 
-// New creates a new module with the given backing implementation.
-func New(provider Provider) *Module {
-  m := &Module{provider: provider}
-  l.Register(m, "outputFunc", "impl")
-  // Default output is just the volume %, "MUT" when muted.
-  m.Output(func(v Volume) bar.Output {
-    if v.Mute {
-      return outputs.Text("MUT")
-    }
-    return outputs.Textf("%d%%", v.Pct())
-  })
-  return m
+		<-m.scheduler.C
+	}
 }
